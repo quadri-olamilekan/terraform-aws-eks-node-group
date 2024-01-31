@@ -1,11 +1,19 @@
+data "terraform_remote_state" "network" {
+  backend = "s3"
+  config = {
+    bucket = "s3-eks-iam-roles-repo-12-source"
+    key    = "eks/terraform.tfstate"
+    region = "us-east-1"
+  }
+}
+
 resource "aws_eks_node_group" "private-nodes" {
-  depends_on      = [null_resource.aws_src_dst_checks]
-  cluster_name    = aws_eks_cluster.cluster.name
+  cluster_name    = data.terraform_remote_state.network.outputs.cluster_name
   node_group_name = "private-nodes"
-  node_role_arn   = module.eks-iam-roles.node_role
+  node_role_arn   = data.terraform_remote_state.network.outputs.node_role
 
   subnet_ids = [
-    for i in range(length(module.eks-vpc.private)) : module.eks-vpc.private[i]
+    for i in range(length(data.terraform_remote_state.network.outputs.private)) : data.terraform_remote_state.network.outputs.private[i]
   ]
 
   capacity_type  = "ON_DEMAND"
@@ -33,6 +41,7 @@ resource "aws_eks_node_group" "private-nodes" {
 
 }
 
+/*
 resource "aws_eks_node_group" "public-nodes" {
   depends_on      = [null_resource.aws_src_dst_checks]
   cluster_name    = aws_eks_cluster.cluster.name
@@ -67,9 +76,17 @@ resource "aws_eks_node_group" "public-nodes" {
 
 }
 
+*/
+
+resource "null_resource" "eks_kubeconfig_updater" {
+
+  provisioner "local-exec" {
+    command = "aws eks update-kubeconfig --region ${var.region} --name ${data.terraform_remote_state.network.outputs.cluster_name}"
+  }
+}
 
 data "external" "thumbprint" {
-  program = ["${path.module}/thumbprint.sh", var.region, "eks", "oidc-thumbprint", "--issuer-url", aws_eks_cluster.cluster.identity[0].oidc[0].issuer]
+  program = ["${path.module}/thumbprint.sh", var.region, "eks", "oidc-thumbprint", "--issuer-url", data.terraform_remote_state.network.outputs.cluster_url]
 }
 
 data "aws_iam_policy_document" "oidc_assume_role_policy" {
@@ -117,10 +134,9 @@ resource "aws_iam_role_policy_attachment" "oidc_attach" {
 }
 
 resource "aws_iam_openid_connect_provider" "eks" {
-  depends_on      = [aws_eks_cluster.cluster]
   client_id_list  = ["sts.amazonaws.com"]
   thumbprint_list = [data.external.thumbprint.result.thumbprint]
-  url             = aws_eks_cluster.cluster.identity[0].oidc[0].issuer
+  url             = data.terraform_remote_state.network.outputs.cluster_url
 }
 
 
@@ -182,7 +198,7 @@ resource "null_resource" "node_ready" {
   provisioner "local-exec" {
     command = <<-EOT
       #!/bin/bash
-      until kubectl get nodes --server=${aws_eks_cluster.cluster.endpoint} -l role=private-node | grep 'Ready' &> /dev/null; do
+      until kubectl get nodes --server=${data.terraform_remote_state.network.outputs.cluster_endpoint} -l role=private-node | grep 'Ready' &> /dev/null; do
         echo "Waiting for nodes with label 'role=private-node' to be ready..."
         sleep 10
       done
@@ -242,7 +258,14 @@ locals {
   istio_charts_url = "https://istio-release.storage.googleapis.com/charts"
 }
 
+resource "null_resource" "helm_update" {
+  provisioner "local-exec" {
+    command = "helm repo update"
+  }
+}
+
 resource "kubernetes_namespace" "istio_system" {
+  depends_on = [aws_eks_node_group.private-nodes]
   metadata {
     name = "istio-system"
   }
@@ -272,6 +295,7 @@ resource "helm_release" "istiod" {
 
 
 resource "kubernetes_labels" "default" {
+  depends_on = [ kubernetes_namespace.istio_system ]
   api_version = "v1"
   kind        = "Namespace"
   metadata {
@@ -283,6 +307,7 @@ resource "kubernetes_labels" "default" {
 }
 
 resource "kubectl_manifest" "kiali" {
+  depends_on = [ helm_release.istiod ]
   for_each           = data.kubectl_file_documents.kiali.manifests
   yaml_body          = each.value
   override_namespace = "istio-system"
@@ -304,103 +329,4 @@ resource "kubectl_manifest" "prometheus" {
 
 data "kubectl_file_documents" "prometheus" {
   content = file("${path.module}/manifests/prometheus.yaml")
-}
-
-
-resource "helm_release" "istio_ingress" {
-  name             = "istio-ingressgateway"
-  chart            = "gateway"
-  repository       = "https://istio-release.storage.googleapis.com/charts"
-  namespace        = "istio-ingress"
-  create_namespace = true
-
-  version = "1.20.2"
-
-  set {
-    name  = "service.type"
-    value = "NodePort"
-  }
-
-  set {
-    name  = "service.ports[0].name"
-    value = "status-port"
-  }
-
-  set {
-    name  = "service.ports[0].port"
-    value = 15021
-  }
-
-  set {
-    name  = "service.ports[0].targetPort"
-    value = 15021
-  }
-
-  set {
-    name  = "service.ports[0].nodePort"
-    value = 30021
-  }
-
-  set {
-    name  = "service.ports[0].protocol"
-    value = "TCP"
-  }
-
-  set {
-    name  = "service.ports[1].name"
-    value = "http2"
-  }
-
-  set {
-    name  = "service.ports[1].port"
-    value = 80
-  }
-
-  set {
-    name  = "service.ports[1].targetPort"
-    value = 80
-  }
-
-  set {
-    name  = "service.ports[1].nodePort"
-    value = 30080
-  }
-
-  set {
-    name  = "service.ports[1].protocol"
-    value = "TCP"
-  }
-
-
-  set {
-    name  = "service.ports[2].name"
-    value = "https"
-  }
-
-  set {
-    name  = "service.ports[2].port"
-    value = 443
-  }
-
-  set {
-    name  = "service.ports[2].targetPort"
-    value = 443
-  }
-
-  set {
-    name  = "service.ports[2].nodePort"
-    value = 30443
-  }
-
-  set {
-    name  = "service.ports[2].protocol"
-    value = "TCP"
-  }
-
-  depends_on = [
-    aws_eks_cluster.cluster,
-    aws_eks_node_group.private-nodes,
-    helm_release.istio-base,
-    helm_release.istiod
-  ]
 }
