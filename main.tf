@@ -330,3 +330,99 @@ resource "kubectl_manifest" "prometheus" {
 data "kubectl_file_documents" "prometheus" {
   content = file("${path.module}/manifests/prometheus.yaml")
 }
+
+data "aws_iam_policy_document" "efs_csi_assume_role_policy" {
+  count = var.create_role ? 1 : 0
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:kube-system:efs-csi-controller-sa", "system:serviceaccount:kube-system:efs-csi-node-sa"]
+    }
+
+    principals {
+      identifiers = [aws_iam_openid_connect_provider.eks.arn]
+      type        = "Federated"
+    }
+  }
+}
+
+# EFS CSI Driver Policy
+# https://github.com/kubernetes-sigs/aws-efs-csi-driver/blob/master/docs/iam-policy-example.json
+data "aws_iam_policy_document" "efs_csi" {
+  count = var.create_role && var.attach_efs_csi_policy ? 1 : 0
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeAvailabilityZones",
+      "elasticfilesystem:DescribeAccessPoints",
+      "elasticfilesystem:DescribeFileSystems",
+      "elasticfilesystem:DescribeMountTargets"
+    ]
+    resources = ["*"]
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["elasticfilesystem:CreateAccessPoint"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringLike"
+      variable = "aws:RequestTag/efs.csi.aws.com/cluster"
+      values   = ["true"]
+    }
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["elasticfilesystem:TagResource"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringLike"
+      variable = "aws:RequestTag/efs.csi.aws.com/cluster"
+      values   = ["true"]
+    }
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["elasticfilesystem:DeleteAccessPoint"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/efs.csi.aws.com/cluster"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_iam_policy" "efs_csi" {
+  count  = var.create_role && var.attach_efs_csi_policy ? 1 : 0
+  name   = "efs-csi-policy"
+  policy = data.aws_iam_policy_document.efs_csi[0].json
+}
+
+resource "aws_iam_role_policy_attachment" "efs_csi" {
+  count      = var.create_role && var.attach_efs_csi_policy ? 1 : 0
+  role       = aws_iam_role.efs_csi[0].name
+  policy_arn = aws_iam_policy.efs_csi[0].arn
+}
+
+resource "aws_iam_role" "efs_csi" {
+  count              = var.create_role ? 1 : 0
+  name               = "efs-csi"
+  assume_role_policy = data.aws_iam_policy_document.efs_csi_assume_role_policy[0].json
+}
+
+resource "aws_eks_addon" "addons" {
+  for_each                    = { for addon in var.addons : addon.name => addon }
+  cluster_name                = data.terraform_remote_state.network.outputs.cluster_name
+  addon_name                  = each.value.name
+  addon_version               = each.value.version
+  resolve_conflicts_on_update = "OVERWRITE"
+  service_account_role_arn    = aws_iam_role.efs_csi[0].arn
+}

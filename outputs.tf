@@ -1,4 +1,4 @@
-output "test_policy_arn" {
+output "eks-oidc_arn" {
   value = aws_iam_role.oidc.arn
 }
 
