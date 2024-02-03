@@ -85,113 +85,6 @@ resource "null_resource" "eks_kubeconfig_updater" {
   }
 }
 
-data "external" "thumbprint" {
-  program = ["${path.module}/thumbprint.sh", var.region, "eks", "oidc-thumbprint", "--issuer-url", data.terraform_remote_state.network.outputs.cluster_url]
-}
-
-data "aws_iam_policy_document" "oidc_assume_role_policy" {
-  statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-    effect  = "Allow"
-
-    condition {
-      test     = "StringEquals"
-      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
-      values   = ["system:serviceaccount:default:eks"]
-    }
-
-    principals {
-      identifiers = [aws_iam_openid_connect_provider.eks.arn]
-      type        = "Federated"
-    }
-  }
-}
-
-resource "aws_iam_role" "oidc" {
-  depends_on         = [aws_iam_openid_connect_provider.eks]
-  assume_role_policy = data.aws_iam_policy_document.oidc_assume_role_policy.json
-  name               = "eks-oidc"
-}
-
-resource "aws_iam_policy" "oidc-policy" {
-  name = "eks-oidc-policy"
-
-  policy = jsonencode({
-    Statement = [{
-      Action = ["*"
-      ]
-      Effect   = "Allow"
-      Resource = "*"
-    }]
-    Version = "2012-10-17"
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "oidc_attach" {
-  depends_on = [aws_iam_role.oidc]
-  role       = aws_iam_role.oidc.name
-  policy_arn = aws_iam_policy.oidc-policy.arn
-}
-
-resource "aws_iam_openid_connect_provider" "eks" {
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = [data.external.thumbprint.result.thumbprint]
-  url             = data.terraform_remote_state.network.outputs.cluster_url
-}
-
-
-data "aws_iam_policy_document" "eks_cluster_autoscaler_assume_role_policy" {
-  statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-    effect  = "Allow"
-
-    condition {
-      test     = "StringEquals"
-      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
-      values   = ["system:serviceaccount:kube-system:cluster-autoscaler"]
-    }
-
-    principals {
-      identifiers = [aws_iam_openid_connect_provider.eks.arn]
-      type        = "Federated"
-    }
-  }
-}
-
-resource "aws_iam_role" "eks_cluster_autoscaler" {
-  depends_on         = [aws_iam_role.oidc]
-  assume_role_policy = data.aws_iam_policy_document.eks_cluster_autoscaler_assume_role_policy.json
-  name               = "eks-cluster-autoscaler"
-}
-
-resource "aws_iam_policy" "eks_cluster_autoscaler" {
-  name = "eks-cluster-autoscaler"
-
-  policy = jsonencode({
-    Statement = [{
-      Action = [
-        "autoscaling:DescribeAutoScalingGroups",
-        "autoscaling:DescribeAutoScalingInstances",
-        "autoscaling:DescribeLaunchConfigurations",
-        "autoscaling:DescribeTags",
-        "autoscaling:SetDesiredCapacity",
-        "autoscaling:TerminateInstanceInAutoScalingGroup",
-        "ec2:DescribeLaunchTemplateVersions",
-        "ec2:DescribeInstanceTypes"
-      ]
-      Effect   = "Allow"
-      Resource = "*"
-    }]
-    Version = "2012-10-17"
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "eks_cluster_autoscaler_attach" {
-  depends_on = [aws_iam_role.eks_cluster_autoscaler]
-  role       = aws_iam_role.eks_cluster_autoscaler.name
-  policy_arn = aws_iam_policy.eks_cluster_autoscaler.arn
-}
-
 resource "null_resource" "node_ready" {
   depends_on = [aws_eks_node_group.private-nodes]
 
@@ -207,6 +100,102 @@ resource "null_resource" "node_ready" {
   }
 }
 
+data "aws_iam_policy_document" "efs_csi_assume_role_policy" {
+  count = var.create_role ? 1 : 0
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    effect  = "Allow"
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(data.terraform_remote_state.network.outputs.oidc-url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:kube-system:efs-csi-controller-sa", "system:serviceaccount:kube-system:efs-csi-node-sa"]
+    }
+
+    principals {
+      identifiers = [data.terraform_remote_state.network.outputs.oidc-arn]
+      type        = "Federated"
+    }
+  }
+}
+
+# EFS CSI Driver Policy
+# https://github.com/kubernetes-sigs/aws-efs-csi-driver/blob/master/docs/iam-policy-example.json
+data "aws_iam_policy_document" "efs_csi" {
+  count = var.create_role && var.attach_efs_csi_policy ? 1 : 0
+
+  statement {
+    effect = "Allow"
+    actions = [
+      "ec2:DescribeAvailabilityZones",
+      "elasticfilesystem:DescribeAccessPoints",
+      "elasticfilesystem:DescribeFileSystems",
+      "elasticfilesystem:DescribeMountTargets"
+    ]
+    resources = ["*"]
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["elasticfilesystem:CreateAccessPoint"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringLike"
+      variable = "aws:RequestTag/efs.csi.aws.com/cluster"
+      values   = ["true"]
+    }
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["elasticfilesystem:TagResource"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringLike"
+      variable = "aws:RequestTag/efs.csi.aws.com/cluster"
+      values   = ["true"]
+    }
+  }
+  statement {
+    effect    = "Allow"
+    actions   = ["elasticfilesystem:DeleteAccessPoint"]
+    resources = ["*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/efs.csi.aws.com/cluster"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_iam_policy" "efs_csi" {
+  count  = var.create_role && var.attach_efs_csi_policy ? 1 : 0
+  name   = "${var.project}-efs-csi-policy"
+  policy = data.aws_iam_policy_document.efs_csi[0].json
+}
+
+resource "aws_iam_role_policy_attachment" "efs_csi" {
+  count      = var.create_role && var.attach_efs_csi_policy ? 1 : 0
+  role       = aws_iam_role.efs_csi[0].name
+  policy_arn = aws_iam_policy.efs_csi[0].arn
+}
+
+resource "aws_iam_role" "efs_csi" {
+  count              = var.create_role ? 1 : 0
+  name               = "${var.project}-efs-csi"
+  assume_role_policy = data.aws_iam_policy_document.efs_csi_assume_role_policy[0].json
+}
+
+resource "aws_eks_addon" "addons" {
+  depends_on                  = [null_resource.node_ready]
+  for_each                    = { for addon in var.addons : addon.name => addon }
+  cluster_name                = data.terraform_remote_state.network.outputs.cluster_name
+  addon_name                  = each.value.name
+  addon_version               = each.value.version
+  resolve_conflicts_on_update = "OVERWRITE"
+  service_account_role_arn    = aws_iam_role.efs_csi[0].arn
+}
 
 data "kubectl_file_documents" "install_autoscaler" {
   content = file("${path.module}/manifests/autoscaler.yaml")
@@ -295,7 +284,7 @@ resource "helm_release" "istiod" {
 
 
 resource "kubernetes_labels" "default" {
-  depends_on = [ kubernetes_namespace.istio_system ]
+  depends_on  = [kubernetes_namespace.istio_system]
   api_version = "v1"
   kind        = "Namespace"
   metadata {
@@ -307,7 +296,7 @@ resource "kubernetes_labels" "default" {
 }
 
 resource "kubectl_manifest" "kiali" {
-  depends_on = [ helm_release.istiod ]
+  depends_on         = [helm_release.istiod]
   for_each           = data.kubectl_file_documents.kiali.manifests
   yaml_body          = each.value
   override_namespace = "istio-system"
@@ -329,100 +318,4 @@ resource "kubectl_manifest" "prometheus" {
 
 data "kubectl_file_documents" "prometheus" {
   content = file("${path.module}/manifests/prometheus.yaml")
-}
-
-data "aws_iam_policy_document" "efs_csi_assume_role_policy" {
-  count = var.create_role ? 1 : 0
-  statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-    effect  = "Allow"
-
-    condition {
-      test     = "StringEquals"
-      variable = "${replace(aws_iam_openid_connect_provider.eks.url, "https://", "")}:sub"
-      values   = ["system:serviceaccount:kube-system:efs-csi-controller-sa", "system:serviceaccount:kube-system:efs-csi-node-sa"]
-    }
-
-    principals {
-      identifiers = [aws_iam_openid_connect_provider.eks.arn]
-      type        = "Federated"
-    }
-  }
-}
-
-# EFS CSI Driver Policy
-# https://github.com/kubernetes-sigs/aws-efs-csi-driver/blob/master/docs/iam-policy-example.json
-data "aws_iam_policy_document" "efs_csi" {
-  count = var.create_role && var.attach_efs_csi_policy ? 1 : 0
-
-  statement {
-    effect = "Allow"
-    actions = [
-      "ec2:DescribeAvailabilityZones",
-      "elasticfilesystem:DescribeAccessPoints",
-      "elasticfilesystem:DescribeFileSystems",
-      "elasticfilesystem:DescribeMountTargets"
-    ]
-    resources = ["*"]
-  }
-  statement {
-    effect    = "Allow"
-    actions   = ["elasticfilesystem:CreateAccessPoint"]
-    resources = ["*"]
-
-    condition {
-      test     = "StringLike"
-      variable = "aws:RequestTag/efs.csi.aws.com/cluster"
-      values   = ["true"]
-    }
-  }
-  statement {
-    effect    = "Allow"
-    actions   = ["elasticfilesystem:TagResource"]
-    resources = ["*"]
-
-    condition {
-      test     = "StringLike"
-      variable = "aws:RequestTag/efs.csi.aws.com/cluster"
-      values   = ["true"]
-    }
-  }
-  statement {
-    effect    = "Allow"
-    actions   = ["elasticfilesystem:DeleteAccessPoint"]
-    resources = ["*"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/efs.csi.aws.com/cluster"
-      values   = ["true"]
-    }
-  }
-}
-
-resource "aws_iam_policy" "efs_csi" {
-  count  = var.create_role && var.attach_efs_csi_policy ? 1 : 0
-  name   = "efs-csi-policy"
-  policy = data.aws_iam_policy_document.efs_csi[0].json
-}
-
-resource "aws_iam_role_policy_attachment" "efs_csi" {
-  count      = var.create_role && var.attach_efs_csi_policy ? 1 : 0
-  role       = aws_iam_role.efs_csi[0].name
-  policy_arn = aws_iam_policy.efs_csi[0].arn
-}
-
-resource "aws_iam_role" "efs_csi" {
-  count              = var.create_role ? 1 : 0
-  name               = "efs-csi"
-  assume_role_policy = data.aws_iam_policy_document.efs_csi_assume_role_policy[0].json
-}
-
-resource "aws_eks_addon" "addons" {
-  for_each                    = { for addon in var.addons : addon.name => addon }
-  cluster_name                = data.terraform_remote_state.network.outputs.cluster_name
-  addon_name                  = each.value.name
-  addon_version               = each.value.version
-  resolve_conflicts_on_update = "OVERWRITE"
-  service_account_role_arn    = aws_iam_role.efs_csi[0].arn
 }

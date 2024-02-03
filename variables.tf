@@ -4,12 +4,6 @@ variable "region" {
   description = "AWS region"
 }
 
-variable "project" {
-  type        = string
-  default     = "eks"
-  description = "Project name"
-}
-
 variable "create_role" {
   type    = bool
   default = true
@@ -18,6 +12,12 @@ variable "create_role" {
 variable "attach_efs_csi_policy" {
   type    = bool
   default = true
+}
+
+variable "project" {
+  type        = string
+  default     = "eks"
+  description = "Project name"
 }
 
 variable "addons" {
@@ -32,4 +32,3 @@ variable "addons" {
     }
   ]
 }
-
