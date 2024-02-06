@@ -244,14 +244,17 @@ resource "kubectl_manifest" "argocd_svc" {
 }
 
 locals {
-  istio_charts_url = "https://istio-release.storage.googleapis.com/charts"
+  istio_charts_url      = "https://istio-release.storage.googleapis.com/charts"
+  prometheus_charts_url = "https://prometheus-community.github.io/helm-charts"
 }
 
+/*
 resource "null_resource" "helm_update" {
   provisioner "local-exec" {
     command = "helm repo update"
   }
 }
+*/
 
 resource "kubernetes_namespace" "istio_system" {
   depends_on = [aws_eks_node_group.private-nodes]
@@ -319,3 +322,17 @@ resource "kubectl_manifest" "prometheus" {
 data "kubectl_file_documents" "prometheus" {
   content = file("${path.module}/manifests/prometheus.yaml")
 }
+
+
+resource "kubectl_manifest" "grafana" {
+  for_each           = data.kubectl_file_documents.grafana.manifests
+  yaml_body          = each.value
+  override_namespace = "istio-system"
+
+  depends_on = [kubectl_manifest.kiali]
+}
+
+data "kubectl_file_documents" "grafana" {
+  content = file("${path.module}/manifests/grafana.yaml")
+}
+
