@@ -302,7 +302,7 @@ resource "kubectl_manifest" "kiali" {
   depends_on         = [helm_release.istiod]
   for_each           = data.kubectl_file_documents.kiali.manifests
   yaml_body          = each.value
-  override_namespace = "istio-system"
+  override_namespace = kubernetes_namespace.istio_system.id
 
   #depends_on = [helm_release.istio_ingress]
 }
@@ -314,7 +314,7 @@ data "kubectl_file_documents" "kiali" {
 resource "kubectl_manifest" "prometheus" {
   for_each           = data.kubectl_file_documents.prometheus.manifests
   yaml_body          = each.value
-  override_namespace = "istio-system"
+  override_namespace = kubernetes_namespace.istio_system.id
 
   depends_on = [kubectl_manifest.kiali]
 }
@@ -327,7 +327,7 @@ data "kubectl_file_documents" "prometheus" {
 resource "kubectl_manifest" "grafana" {
   for_each           = data.kubectl_file_documents.grafana.manifests
   yaml_body          = each.value
-  override_namespace = "istio-system"
+  override_namespace = kubernetes_namespace.istio_system.id
 
   depends_on = [kubectl_manifest.kiali]
 }
@@ -336,3 +336,21 @@ data "kubectl_file_documents" "grafana" {
   content = file("${path.module}/manifests/grafana.yaml")
 }
 
+resource "kubernetes_namespace" "istio-ingress" {
+  depends_on = [aws_eks_node_group.private-nodes]
+  metadata {
+    name = "istio-ingress"
+  }
+}
+
+resource "kubectl_manifest" "istio-ingress" {
+  for_each           = data.kubectl_file_documents.ingress.manifests
+  yaml_body          = each.value
+  override_namespace = kubernetes_namespace.istio-ingress.id
+
+  depends_on = [kubernetes_namespace.istio-ingress, helm_release.istio-base]
+}
+
+data "kubectl_file_documents" "ingress" {
+  content = file("${path.module}/manifests/ingress.yaml")
+}
