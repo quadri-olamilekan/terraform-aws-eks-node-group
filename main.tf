@@ -248,61 +248,62 @@ locals {
   prometheus_charts_url = "https://prometheus-community.github.io/helm-charts"
 }
 
-/*
-resource "null_resource" "helm_update" {
-  provisioner "local-exec" {
-    command = "helm repo update"
-  }
-}
-*/
-
 resource "kubernetes_namespace" "istio_system" {
-  depends_on = [aws_eks_node_group.private-nodes]
+  depends_on = [null_resource.node_ready]
   metadata {
     name = "istio-system"
   }
 }
 
-resource "helm_release" "istio-base" {
-  repository      = local.istio_charts_url
-  chart           = "base"
-  name            = "istio-base"
-  namespace       = kubernetes_namespace.istio_system.id
+resource "helm_release" "istio_base" {
+  name       = "istio-base"
+  repository = local.istio_charts_url
+  chart      = "base"
+
+  timeout         = 120
   cleanup_on_fail = true
   force_update    = false
-
-  depends_on = [kubernetes_namespace.istio_system]
+  namespace       = kubernetes_namespace.istio_system.metadata.0.name
+  depends_on      = [kubernetes_namespace.istio_system]
 }
 
 resource "helm_release" "istiod" {
-  repository      = local.istio_charts_url
-  chart           = "istiod"
-  name            = "istiod"
-  namespace       = kubernetes_namespace.istio_system.id
+  name       = "istiod"
+  repository = local.istio_charts_url
+  chart      = "istiod"
+
+  timeout         = 120
   cleanup_on_fail = true
   force_update    = false
+  namespace       = kubernetes_namespace.istio_system.metadata.0.name
 
-  depends_on = [helm_release.istio-base]
+  set {
+    name  = "meshConfig.accessLogFile"
+    value = "/dev/stdout"
+  }
+
+  depends_on = [kubernetes_namespace.istio_system, helm_release.istio_base]
 }
 
+resource "helm_release" "istio_ingress" {
+  name       = "istio-ingress"
+  repository = local.istio_charts_url
+  chart      = "gateway"
 
-resource "kubernetes_labels" "default" {
-  depends_on  = [kubernetes_namespace.istio_system]
-  api_version = "v1"
-  kind        = "Namespace"
-  metadata {
-    name = "default"
-  }
-  labels = {
-    istio-injection = "enabled"
-  }
+  timeout         = 500
+  cleanup_on_fail = true
+  force_update    = false
+  namespace       = kubernetes_namespace.istio_system.metadata.0.name
+
+  depends_on = [kubernetes_namespace.istio_system, helm_release.istiod]
 }
+
 
 resource "kubectl_manifest" "kiali" {
-  depends_on         = [helm_release.istiod]
+  depends_on         = [helm_release.istio_ingress]
   for_each           = data.kubectl_file_documents.kiali.manifests
   yaml_body          = each.value
-  override_namespace = kubernetes_namespace.istio_system.id
+  override_namespace = kubernetes_namespace.istio_system.metadata.0.name
 
 }
 
@@ -313,9 +314,8 @@ data "kubectl_file_documents" "kiali" {
 resource "kubectl_manifest" "prometheus" {
   for_each           = data.kubectl_file_documents.prometheus.manifests
   yaml_body          = each.value
-  override_namespace = kubernetes_namespace.istio_system.id
-
-  depends_on = [kubectl_manifest.kiali]
+  override_namespace = kubernetes_namespace.istio_system.metadata.0.name
+  depends_on         = [kubectl_manifest.kiali]
 }
 
 data "kubectl_file_documents" "prometheus" {
@@ -326,24 +326,45 @@ data "kubectl_file_documents" "prometheus" {
 resource "kubectl_manifest" "grafana" {
   for_each           = data.kubectl_file_documents.grafana.manifests
   yaml_body          = each.value
-  override_namespace = kubernetes_namespace.istio_system.id
-
-  depends_on = [kubectl_manifest.kiali]
+  override_namespace = kubernetes_namespace.istio_system.metadata.0.name
+  depends_on         = [kubectl_manifest.prometheus]
 }
 
 data "kubectl_file_documents" "grafana" {
   content = file("${path.module}/manifests/grafana.yaml")
 }
 
-/*
-resource "helm_release" "istio_ingress" {
-  depends_on       = [kubectl_manifest.kiali]
-  name             = "istio-ingressgateway"
-  chart            = "gateway"
-  repository       = local.istio_charts_url
-  namespace        = "istio-ingress"
-  create_namespace = true
-  cleanup_on_fail  = true
-  force_update     = false
+resource "kubernetes_namespace" "ml-app" {
+  depends_on = [kubectl_manifest.grafana]
+  metadata {
+    name = "ml-app"
+  }
 }
-*/
+
+resource "kubernetes_labels" "ml-app-label" {
+  depends_on  = [kubernetes_namespace.ml-app]
+  api_version = "v1"
+  kind        = "Namespace"
+  metadata {
+    name = "ml-app"
+  }
+  labels = {
+    istio-injection = "enabled"
+  }
+}
+
+resource "null_resource" "argo_repo_secret" {
+
+  provisioner "local-exec" {
+    command = "kubectl create -f ./argo-deployment/secret.yml  --server=${data.terraform_remote_state.network.outputs.cluster_endpoint}"
+  }
+  depends_on = [kubernetes_labels.ml-app-label]
+}
+
+resource "null_resource" "argo_repo_deploy" {
+
+  provisioner "local-exec" {
+    command = "kubectl apply -f ./argo-deployment/deployment.yml  --server=${data.terraform_remote_state.network.outputs.cluster_endpoint}"
+  }
+  depends_on = [null_resource.argo_repo_secret]
+}
