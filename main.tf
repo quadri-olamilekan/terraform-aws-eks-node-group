@@ -255,6 +255,25 @@ resource "kubernetes_namespace" "istio_system" {
   }
 }
 
+resource "kubernetes_namespace" "ml-app" {
+  depends_on = [null_resource.node_ready]
+  metadata {
+    name = "ml-app"
+  }
+}
+
+resource "kubernetes_labels" "ml-app-label" {
+  depends_on  = [kubernetes_namespace.ml-app]
+  api_version = "v1"
+  kind        = "Namespace"
+  metadata {
+    name = "ml-app"
+  }
+  labels = {
+    istio-injection = "enabled"
+  }
+}
+
 resource "helm_release" "istio_base" {
   name       = "istio-base"
   repository = local.istio_charts_url
@@ -293,9 +312,9 @@ resource "helm_release" "istio_ingress" {
   timeout         = 500
   cleanup_on_fail = true
   force_update    = false
-  namespace       = kubernetes_namespace.istio_system.metadata.0.name
+  namespace       = kubernetes_namespace.ml-app.metadata.0.name
 
-  depends_on = [kubernetes_namespace.istio_system, helm_release.istiod]
+  depends_on = [kubernetes_namespace.ml-app, helm_release.istiod]
 }
 
 
@@ -334,31 +353,13 @@ data "kubectl_file_documents" "grafana" {
   content = file("${path.module}/manifests/grafana.yaml")
 }
 
-resource "kubernetes_namespace" "ml-app" {
-  depends_on = [kubectl_manifest.grafana]
-  metadata {
-    name = "ml-app"
-  }
-}
-
-resource "kubernetes_labels" "ml-app-label" {
-  depends_on  = [kubernetes_namespace.ml-app]
-  api_version = "v1"
-  kind        = "Namespace"
-  metadata {
-    name = "ml-app"
-  }
-  labels = {
-    istio-injection = "enabled"
-  }
-}
 
 resource "null_resource" "argo_repo_secret" {
 
   provisioner "local-exec" {
     command = "kubectl create -f ./argo-deployment/secret.yml  --server=${data.terraform_remote_state.network.outputs.cluster_endpoint}"
   }
-  depends_on = [kubernetes_labels.ml-app-label]
+  depends_on = [kubectl_manifest.grafana]
 }
 
 resource "null_resource" "argo_repo_deploy" {
